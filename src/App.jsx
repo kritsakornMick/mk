@@ -459,6 +459,18 @@ export default function App() {
     return { th: 'ใบเสนอราคา', en: 'QUOTATION' };
   };
 
+  const getCustomerSignatureLabel = (type) => {
+    if (type === 'invoice') return 'ผู้รับใบแจ้งหนี้';
+    if (type === 'receipt') return 'ผู้รับใบเสร็จรับเงิน';
+    return 'ผู้ยอมรับใบเสนอราคา';
+  };
+
+  const getCompanySignatureLabel = (type) => {
+    if (type === 'invoice') return 'ผู้อนุมัติใบแจ้งหนี้';
+    if (type === 'receipt') return 'ผู้มีอำนาจลงนาม';
+    return 'ผู้อนุมัติใบเสนอราคา';
+  };
+
   return (
     <div className="flex min-h-screen bg-slate-50 text-slate-800">
       {/* Sidebar */}
@@ -1153,7 +1165,8 @@ export default function App() {
             {(() => {
               const { subtotal, discountAmount, vatAmount, whtAmount, grandTotal } = calculateTotals(selectedDoc);
               return (
-                <div className="flex justify-between items-start gap-8">
+                <div className="space-y-8">
+                  <div className="flex justify-between items-start gap-8">
                   <div className="flex-1 text-xs text-slate-600 space-y-3">
                     <div>
                       <div className="font-bold text-slate-700 mb-1">หมายเหตุ / เงื่อนไข:</div>
@@ -1195,6 +1208,23 @@ export default function App() {
                     <div className="flex justify-between font-bold text-base border-t-2 border-slate-800 pt-2 text-blue-700">
                       <span>ยอดเงินสุทธิ</span>
                       <span>฿{grandTotal.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
+                    </div>
+                  </div>
+                  </div>
+                  <div className="mt-8 grid grid-cols-2 gap-6 text-center text-sm text-slate-700">
+                    <div className="min-h-40 rounded-2xl border border-slate-200 px-5 py-4">
+                      <div className="font-bold text-slate-900">สำหรับลูกค้า ({getCustomerSignatureLabel(selectedDoc.doc_type)})</div>
+                      <div className="mx-auto mt-12 w-4/5 border-b border-dotted border-slate-400" />
+                      <div className="mt-2">(ลงชื่อ) ........................................................</div>
+                      <div className="mt-1">{getCustomerSignatureLabel(selectedDoc.doc_type)}</div>
+                      <div className="mt-1">วันที่ ........../........../..........</div>
+                    </div>
+                    <div className="min-h-40 rounded-2xl border border-slate-200 px-5 py-4">
+                      <div className="font-bold text-slate-900">ในนาม {company.company_name}</div>
+                      <div className="mx-auto mt-12 w-4/5 border-b border-dotted border-slate-400" />
+                      <div className="mt-2">(ลงชื่อ) ........................................................</div>
+                      <div className="mt-1">{getCompanySignatureLabel(selectedDoc.doc_type)}</div>
+                      <div className="mt-1">วันที่ ........../........../..........</div>
                     </div>
                   </div>
                 </div>
