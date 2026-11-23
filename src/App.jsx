@@ -12,7 +12,7 @@ export default function App() {
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
   const [company, setCompany] = useState({
-    company_name: 'บริษัท ตัวอย่าง จำกัด (สำนักงานใหญ่)',
+    company_name: 'บริษัท สปีดี้ จำกัด (สำนักงานใหญ่)',
     tax_id: '0105566001234',
     address: '999 อาคารออฟฟิศทาวเวอร์ ถนนพระราม 9 กรุงเทพฯ 10310',
     phone: '02-123-4567',
@@ -30,6 +30,7 @@ export default function App() {
 
   // State สำหรับฟอร์มลูกค้า / สินค้าใหม่
   const [newCustomer, setNewCustomer] = useState({ name: '', tax_id: '', address: '', phone: '' });
+  const [editingCustomer, setEditingCustomer] = useState(null);
   const [newProduct, setNewProduct] = useState({ name: '', description: '', unit: 'งาน', unit_price: 0 });
 
   // โหลดข้อมูลทั้งหมดจาก Supabase
@@ -108,16 +109,38 @@ export default function App() {
   // แปลงเอกสารข้ามขั้นตอน (เช่น QT -> INV หรือ INV -> REC)
   const handleConvertDocument = async (sourceDoc, targetType) => {
     const labelMap = { invoice: 'ใบแจ้งหนี้ (INV)', receipt: 'ใบเสร็จรับเงิน (REC)' };
+    const requiredStatus = 'approved';
+    const targetLabel = sourceDoc.doc_type === 'invoice'
+      ? 'บันทึกสถานะใบแจ้งหนี้ว่าชำระแล้ว'
+      : 'ลูกค้าอนุมัติใบเสนอราคาแล้ว';
+
+    if (sourceDoc.status !== requiredStatus) {
+      return alert(`ยังออก${labelMap[targetType]}ไม่ได้ กรุณา${targetLabel}ก่อน`);
+    }
+
+    const existingDocument = documents.find(doc =>
+      doc.doc_type === targetType && String(doc.source_document_id) === String(sourceDoc.id)
+    );
+    if (existingDocument) {
+      return alert(`เอกสารนี้มี${labelMap[targetType]} ${existingDocument.doc_no} แล้ว`);
+    }
+
     if (!window.confirm(`ต้องการสร้าง ${labelMap[targetType]} จากเอกสาร ${sourceDoc.doc_no} ใช่หรือไม่?`)) return;
 
     const prefixMap = { invoice: 'INV', receipt: 'REC' };
     const uniqueSuffix = Date.now().toString().slice(-4);
     const newDocNo = `${prefixMap[targetType]}-${new Date().getFullYear()}-${uniqueSuffix}`;
 
-    const { id, quotation_items, created_at, doc_no, doc_type, ...restHeader } = sourceDoc;
+    const { id, quotation_items, created_at, doc_no, doc_type, source_document_id, ...restHeader } = sourceDoc;
     const { data: createdDoc, error } = await supabase
       .from('quotations')
-      .insert([{ ...restHeader, doc_no: newDocNo, doc_type: targetType, status: 'pending' }])
+      .insert([{
+        ...restHeader,
+        doc_no: newDocNo,
+        doc_type: targetType,
+        source_document_id: String(sourceDoc.id),
+        status: targetType === 'receipt' ? 'approved' : 'pending'
+      }])
       .select()
       .single();
 
@@ -129,7 +152,12 @@ export default function App() {
     }));
 
     if (clonedItems.length > 0) {
-      await supabase.from('quotation_items').insert(clonedItems);
+      const { error: itemsError } = await supabase.from('quotation_items').insert(clonedItems);
+      if (itemsError) {
+        const { error: cleanupError } = await supabase.from('quotations').delete().eq('id', createdDoc.id);
+        const cleanupMessage = cleanupError ? ` และลบเอกสารที่สร้างค้างไว้ไม่สำเร็จ: ${cleanupError.message}` : '';
+        return alert('สร้างรายการสินค้าในเอกสารไม่สำเร็จ: ' + itemsError.message + cleanupMessage);
+      }
     }
 
     await fetchAllData();
@@ -140,6 +168,13 @@ export default function App() {
   // บันทึกการแก้ไขเอกสาร A4
   const handleSaveDocument = async () => {
     if (!selectedDoc) return;
+    const hasChildDocuments = documents.some(doc =>
+      String(doc.source_document_id) === String(selectedDoc.id)
+    );
+    if (hasChildDocuments && selectedDoc.status !== 'approved') {
+      return alert('เปลี่ยนสถานะย้อนกลับไม่ได้ เนื่องจากมีการออกเอกสารขั้นตอนถัดไปแล้ว กรุณาลบเอกสารปลายทางก่อน');
+    }
+
     setSaving(true);
     const { id, quotation_items, created_at, ...headerFields } = selectedDoc;
 
@@ -150,13 +185,24 @@ export default function App() {
       return;
     }
 
-    await supabase.from('quotation_items').delete().eq('quotation_id', id);
+    const { error: deleteItemsError } = await supabase.from('quotation_items').delete().eq('quotation_id', id);
+    if (deleteItemsError) {
+      alert('บันทึกรายการสินค้าไม่สำเร็จ: ' + deleteItemsError.message);
+      setSaving(false);
+      return;
+    }
     const itemsToInsert = quotation_items.map(({ id: itemId, ...rest }) => ({ ...rest, quotation_id: id }));
     if (itemsToInsert.length > 0) {
-      await supabase.from('quotation_items').insert(itemsToInsert);
+      const { error: insertItemsError } = await supabase.from('quotation_items').insert(itemsToInsert);
+      if (insertItemsError) {
+        alert('บันทึกรายการสินค้าไม่สำเร็จ: ' + insertItemsError.message);
+        setSaving(false);
+        return;
+      }
     }
 
     await fetchAllData();
+    setSelectedDoc({ ...selectedDoc, ...headerFields });
     setSaving(false);
     setIsEditing(false);
     alert('บันทึกข้อมูลเรียบร้อยแล้ว!');
@@ -164,10 +210,48 @@ export default function App() {
 
   // ลบเอกสาร
   const handleDeleteDocument = async (id, docNo) => {
+    const hasChildDocuments = documents.some(doc => String(doc.source_document_id) === String(id));
+    if (hasChildDocuments) {
+      return alert(`ลบ ${docNo} ไม่ได้ เนื่องจากมีเอกสารที่ออกต่อจากรายการนี้ กรุณาลบเอกสารปลายทางก่อน`);
+    }
     if (!window.confirm(`ยืนยันการลบเอกสาร ${docNo} ?`)) return;
-    await supabase.from('quotations').delete().eq('id', id);
+    const { error } = await supabase.from('quotations').delete().eq('id', id);
+    if (error) return alert('ลบเอกสารไม่สำเร็จ: ' + error.message);
     setDocuments(documents.filter(d => d.id !== id));
     if (selectedDoc?.id === id) setSelectedDoc(null);
+  };
+
+  const getStatusLabel = (doc) => {
+    if (doc.status === 'draft') return 'แบบร่าง';
+    if (doc.status === 'approved') {
+      if (doc.doc_type === 'quotation' || !doc.doc_type) return 'ลูกค้าอนุมัติ';
+      if (doc.doc_type === 'invoice') return 'ชำระเงินแล้ว';
+      return 'ออกใบเสร็จแล้ว';
+    }
+    if (doc.status === 'pending') {
+      if (doc.doc_type === 'quotation' || !doc.doc_type) return 'รอลูกค้าอนุมัติ';
+      if (doc.doc_type === 'invoice') return 'รอชำระเงิน';
+      return 'รอออกใบเสร็จ';
+    }
+    return doc.status;
+  };
+
+  const getStatusOptions = (doc) => {
+    const options = [
+      { value: 'draft', label: 'แบบร่าง' },
+      {
+        value: 'pending',
+        label: doc.doc_type === 'invoice' ? 'รอชำระเงิน' : doc.doc_type === 'receipt' ? 'รอออกใบเสร็จ' : 'รอลูกค้าอนุมัติ'
+      }
+    ];
+    if (doc.doc_type === 'quotation' || !doc.doc_type) {
+      options.push({ value: 'approved', label: 'ลูกค้าอนุมัติ' });
+    } else if (doc.doc_type === 'invoice') {
+      options.push({ value: 'approved', label: 'ชำระเงินแล้ว' });
+    } else {
+      options.push({ value: 'approved', label: 'ออกใบเสร็จแล้ว' });
+    }
+    return options;
   };
 
   // เพิ่มลูกค้าใหม่
@@ -175,10 +259,35 @@ export default function App() {
     e.preventDefault();
     if (!newCustomer.name) return;
     const { data, error } = await supabase.from('customers').insert([newCustomer]).select().single();
-    if (!error && data) {
-      setCustomers([data, ...customers]);
-      setNewCustomer({ name: '', tax_id: '', address: '', phone: '' });
-    }
+    if (error) return alert('เพิ่มลูกค้าไม่สำเร็จ: ' + error.message);
+    setCustomers(currentCustomers => [data, ...currentCustomers]);
+    setNewCustomer({ name: '', tax_id: '', address: '', phone: '' });
+  };
+
+  const handleSaveCustomer = async (e) => {
+    e.preventDefault();
+    if (!editingCustomer?.name.trim()) return alert('กรุณาระบุชื่อลูกค้า');
+
+    const { id, ...customerFields } = editingCustomer;
+    const { data, error } = await supabase
+      .from('customers')
+      .update(customerFields)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) return alert('บันทึกข้อมูลลูกค้าไม่สำเร็จ: ' + error.message);
+    setCustomers(currentCustomers => currentCustomers.map(customer => customer.id === id ? data : customer));
+    setEditingCustomer(null);
+  };
+
+  const handleDeleteCustomer = async (customer) => {
+    if (!window.confirm(`ยืนยันการลบข้อมูลลูกค้า "${customer.name}" หรือไม่?`)) return;
+
+    const { error } = await supabase.from('customers').delete().eq('id', customer.id);
+    if (error) return alert('ลบข้อมูลลูกค้าไม่สำเร็จ: ' + error.message);
+    setCustomers(currentCustomers => currentCustomers.filter(item => item.id !== customer.id));
+    if (editingCustomer?.id === customer.id) setEditingCustomer(null);
   };
 
   // เพิ่มสินค้า/บริการใหม่
@@ -418,8 +527,8 @@ export default function App() {
               <div className="flex gap-2">
                 {[
                   { id: 'all', label: 'ทั้งหมด' },
-                  { id: 'pending', label: 'รอดำเนินการ' },
-                  { id: 'approved', label: 'อนุมัติ / ชำระแล้ว' },
+                  { id: 'pending', label: activeMenu === 'invoice' ? 'รอชำระเงิน' : activeMenu === 'quotation' ? 'รอลูกค้าอนุมัติ' : 'รอออกใบเสร็จ' },
+                  { id: 'approved', label: activeMenu === 'quotation' ? 'ลูกค้าอนุมัติ' : activeMenu === 'invoice' ? 'ชำระเงินแล้ว' : 'ออกใบเสร็จแล้ว' },
                   { id: 'draft', label: 'แบบร่าง' }
                 ].map(tab => (
                   <button
@@ -458,6 +567,11 @@ export default function App() {
                         <td className="py-4 px-6">
                           <div className="font-medium text-slate-900">{doc.customer_name}</div>
                           <div className="text-xs text-slate-500">{doc.project_title}</div>
+                          {doc.source_document_id && (
+                            <div className="text-xs text-blue-600">
+                              อ้างอิง {documents.find(source => String(source.id) === String(doc.source_document_id))?.doc_no || 'เอกสารต้นทาง'}
+                            </div>
+                          )}
                         </td>
                         <td className="py-4 px-6 text-sm text-slate-600">{doc.issue_date}</td>
                         <td className="py-4 px-6 text-right font-semibold text-slate-900">
@@ -470,15 +584,16 @@ export default function App() {
                             'bg-amber-100 text-amber-700'
                           }`}>
                             {doc.status === 'approved' ? <CheckCircle className="w-3.5 h-3.5" /> : <Clock className="w-3.5 h-3.5" />}
-                            {doc.status === 'approved' ? 'อนุมัติ / ชำระแล้ว' : doc.status === 'draft' ? 'แบบร่าง' : 'รอดำเนินการ'}
+                            {getStatusLabel(doc)}
                           </span>
                         </td>
                         <td className="py-4 px-6 text-right space-x-2">
                           {activeMenu === 'quotation' && (
                             <button
                               onClick={() => handleConvertDocument(doc, 'invoice')}
-                              title="ส่งต่อเป็นใบแจ้งหนี้"
-                              className="px-2.5 py-1.5 bg-blue-50 text-blue-700 hover:bg-blue-100 rounded-lg text-xs font-medium inline-flex items-center gap-1"
+                              disabled={doc.status !== 'approved' || documents.some(item => item.doc_type === 'invoice' && String(item.source_document_id) === String(doc.id))}
+                              title={doc.status !== 'approved' ? 'ต้องได้รับอนุมัติจากลูกค้าก่อน' : 'ส่งต่อเป็นใบแจ้งหนี้'}
+                              className="px-2.5 py-1.5 bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-xs font-medium inline-flex items-center gap-1"
                             >
                               <ArrowRightCircle className="w-3.5 h-3.5" /> ออกใบแจ้งหนี้
                             </button>
@@ -486,8 +601,9 @@ export default function App() {
                           {activeMenu === 'invoice' && (
                             <button
                               onClick={() => handleConvertDocument(doc, 'receipt')}
-                              title="ออกใบเสร็จรับเงิน"
-                              className="px-2.5 py-1.5 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 rounded-lg text-xs font-medium inline-flex items-center gap-1"
+                              disabled={doc.status !== 'approved' || documents.some(item => item.doc_type === 'receipt' && String(item.source_document_id) === String(doc.id))}
+                              title={doc.status !== 'approved' ? 'ต้องบันทึกสถานะชำระเงินก่อน' : 'ออกใบเสร็จรับเงิน'}
+                              className="px-2.5 py-1.5 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-xs font-medium inline-flex items-center gap-1"
                             >
                               <ArrowRightCircle className="w-3.5 h-3.5" /> ออกใบเสร็จ
                             </button>
@@ -537,13 +653,50 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {customers.map(c => (
+                  {customers.map(c => editingCustomer?.id === c.id ? (
+                    <tr key={c.id}>
+                      <td colSpan="4" className="p-3">
+                        <form onSubmit={handleSaveCustomer} className="grid grid-cols-1 md:grid-cols-5 gap-3">
+                          <input
+                            required
+                            aria-label="ชื่อบริษัทลูกค้า"
+                            value={editingCustomer.name}
+                            onChange={e => setEditingCustomer({ ...editingCustomer, name: e.target.value })}
+                            className="border border-slate-200 px-3 py-2 rounded-xl text-sm"
+                          />
+                          <input
+                            aria-label="เลขประจำตัวผู้เสียภาษี"
+                            value={editingCustomer.tax_id || ''}
+                            onChange={e => setEditingCustomer({ ...editingCustomer, tax_id: e.target.value })}
+                            className="border border-slate-200 px-3 py-2 rounded-xl text-sm"
+                          />
+                          <input
+                            aria-label="เบอร์โทรศัพท์"
+                            value={editingCustomer.phone || ''}
+                            onChange={e => setEditingCustomer({ ...editingCustomer, phone: e.target.value })}
+                            className="border border-slate-200 px-3 py-2 rounded-xl text-sm"
+                          />
+                          <input
+                            aria-label="ที่อยู่"
+                            value={editingCustomer.address || ''}
+                            onChange={e => setEditingCustomer({ ...editingCustomer, address: e.target.value })}
+                            className="border border-slate-200 px-3 py-2 rounded-xl text-sm"
+                          />
+                          <div className="flex justify-end gap-3">
+                            <button type="submit" className="text-emerald-600 hover:underline">บันทึก</button>
+                            <button type="button" onClick={() => setEditingCustomer(null)} className="text-slate-500 hover:underline">ยกเลิก</button>
+                          </div>
+                        </form>
+                      </td>
+                    </tr>
+                  ) : (
                     <tr key={c.id}>
                       <td className="py-3 px-6 font-semibold">{c.name}</td>
                       <td className="py-3 px-6">{c.tax_id}</td>
                       <td className="py-3 px-6 text-slate-500">{c.address}</td>
-                      <td className="py-3 px-6 text-right">
-                        <button onClick={async () => { await supabase.from('customers').delete().eq('id', c.id); setCustomers(customers.filter(x => x.id !== c.id)); }} className="text-red-500 hover:underline">ลบ</button>
+                      <td className="py-3 px-6 text-right whitespace-nowrap">
+                        <button onClick={() => setEditingCustomer({ ...c })} className="text-blue-600 hover:underline mr-4">แก้ไข</button>
+                        <button onClick={() => handleDeleteCustomer(c)} className="text-red-500 hover:underline">ลบ</button>
                       </td>
                     </tr>
                   ))}
@@ -641,9 +794,9 @@ export default function App() {
                 onChange={(e) => setSelectedDoc({ ...selectedDoc, status: e.target.value })}
                 className="bg-slate-700 text-sm rounded-lg px-3 py-1.5 border border-slate-600"
               >
-                <option value="draft">สถานะ: แบบร่าง</option>
-                <option value="pending">สถานะ: รอดำเนินการ</option>
-                <option value="approved">สถานะ: อนุมัติ / ชำระแล้ว</option>
+                {getStatusOptions(selectedDoc).map(option => (
+                  <option key={option.value} value={option.value}>สถานะ: {option.label}</option>
+                ))}
               </select>
             </div>
             <div className="flex items-center gap-2">
