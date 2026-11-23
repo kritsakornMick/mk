@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
+import speedyPackageExpressLogo from './assets/speedy-package-express-logo.png';
 import {
   FileText, Plus, Search, Printer, Edit3, Save, Trash2,
   CheckCircle, Clock, X, Building2, RefreshCw, LayoutDashboard,
@@ -27,6 +28,10 @@ export default function App() {
   const [selectedDoc, setSelectedDoc] = useState(null);
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [companyLogoFile, setCompanyLogoFile] = useState(null);
+  const [companyLogoPreview, setCompanyLogoPreview] = useState(null);
+  const [documentLogoFile, setDocumentLogoFile] = useState(null);
+  const [documentLogoPreview, setDocumentLogoPreview] = useState(null);
 
   // State สำหรับฟอร์มลูกค้า / สินค้าใหม่
   const [newCustomer, setNewCustomer] = useState({ name: '', tax_id: '', address: '', phone: '' });
@@ -64,6 +69,13 @@ export default function App() {
     const whtAmount = afterDiscount * (Number(doc?.wht_percent || 0) / 100);
     const grandTotal = afterDiscount + vatAmount - whtAmount;
     return { subtotal, discountAmount, afterDiscount, vatAmount, whtAmount, grandTotal };
+  };
+
+  const getLogoUploadErrorMessage = (error) => {
+    if (error.message?.toLowerCase().includes('bucket not found')) {
+      return 'ยังไม่มีพื้นที่เก็บโลโก้ใน Supabase กรุณารัน SQL migration 20261123010000_add_company_logo_storage.sql และ 20261123020000_add_document_logo_override.sql ตามลำดับใน Supabase SQL Editor แล้วลองใหม่';
+    }
+    return error.message;
   };
 
   // สร้างเอกสารใหม่ตามประเภท (QT / INV / REC)
@@ -178,6 +190,25 @@ export default function App() {
     setSaving(true);
     const { id, quotation_items, created_at, ...headerFields } = selectedDoc;
 
+    if (documentLogoFile) {
+      const { error: uploadError } = await supabase.storage
+        .from('company-assets')
+        .upload(`document-logos/${id}`, documentLogoFile, {
+          cacheControl: '0',
+          contentType: documentLogoFile.type,
+          upsert: true
+        });
+
+      if (uploadError) {
+        alert('อัปโหลดโลโก้เอกสารไม่สำเร็จ: ' + getLogoUploadErrorMessage(uploadError));
+        setSaving(false);
+        return;
+      }
+
+      const { data } = supabase.storage.from('company-assets').getPublicUrl(`document-logos/${id}`);
+      headerFields.logo_url = `${data.publicUrl}?v=${Date.now()}`;
+    }
+
     const { error: headerErr } = await supabase.from('quotations').update(headerFields).eq('id', id);
     if (headerErr) {
       alert('บันทึกไม่สำเร็จ: ' + headerErr.message);
@@ -203,6 +234,8 @@ export default function App() {
 
     await fetchAllData();
     setSelectedDoc({ ...selectedDoc, ...headerFields });
+    setDocumentLogoFile(null);
+    setDocumentLogoPreview(null);
     setSaving(false);
     setIsEditing(false);
     alert('บันทึกข้อมูลเรียบร้อยแล้ว!');
@@ -305,9 +338,107 @@ export default function App() {
   const handleSaveCompany = async (e) => {
     e.preventDefault();
     setSaving(true);
-    await supabase.from('company_settings').upsert({ id: 1, ...company });
+
+    let logoUrl = company.logo_url || null;
+    if (companyLogoFile) {
+      const logoPath = 'company-logo/current';
+      const { error: uploadError } = await supabase.storage
+        .from('company-assets')
+        .upload(logoPath, companyLogoFile, {
+          cacheControl: '0',
+          contentType: companyLogoFile.type,
+          upsert: true
+        });
+
+      if (uploadError) {
+        alert('อัปโหลดโลโก้ไม่สำเร็จ: ' + getLogoUploadErrorMessage(uploadError));
+        setSaving(false);
+        return;
+      }
+
+      const { data } = supabase.storage.from('company-assets').getPublicUrl(logoPath);
+      logoUrl = `${data.publicUrl}?v=${Date.now()}`;
+    }
+
+    const updatedCompany = { ...company, logo_url: logoUrl };
+    const { error } = await supabase.from('company_settings').upsert({ id: 1, ...updatedCompany });
+    if (error) {
+      alert('บันทึกข้อมูลบริษัทไม่สำเร็จ: ' + error.message);
+      setSaving(false);
+      return;
+    }
+
+    setCompany(updatedCompany);
+    setCompanyLogoFile(null);
+    setCompanyLogoPreview(null);
     setSaving(false);
     alert('บันทึกข้อมูลบริษัทเรียบร้อยแล้ว!');
+  };
+
+  const handleCompanyLogoChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      alert('เลือกไฟล์ภาพ PNG, JPG หรือ WEBP เท่านั้น');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      alert('ขนาดไฟล์โลโก้ต้องไม่เกิน 5 MB');
+      e.target.value = '';
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      setCompanyLogoFile(file);
+      setCompanyLogoPreview(String(reader.result));
+    };
+    reader.onerror = () => alert('อ่านไฟล์ภาพไม่สำเร็จ กรุณาลองเลือกไฟล์อีกครั้ง');
+    reader.readAsDataURL(file);
+  };
+
+  const handleDocumentLogoChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      alert('เลือกไฟล์ภาพ PNG, JPG หรือ WEBP เท่านั้น');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      alert('ขนาดไฟล์โลโก้ต้องไม่เกิน 5 MB');
+      e.target.value = '';
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      setDocumentLogoFile(file);
+      setDocumentLogoPreview(String(reader.result));
+    };
+    reader.onerror = () => alert('อ่านไฟล์ภาพไม่สำเร็จ กรุณาลองเลือกไฟล์อีกครั้ง');
+    reader.readAsDataURL(file);
+  };
+
+  const handleUseCompanyLogo = () => {
+    setDocumentLogoFile(null);
+    setDocumentLogoPreview(null);
+    setSelectedDoc({ ...selectedDoc, logo_url: null });
+  };
+
+  const handleCloseDocument = () => {
+    setSelectedDoc(null);
+    setDocumentLogoFile(null);
+    setDocumentLogoPreview(null);
+  };
+
+  const handleResetCompanyLogo = () => {
+    setCompanyLogoFile(null);
+    setCompanyLogoPreview(null);
+    setCompany({ ...company, logo_url: null });
   };
 
   // กรองเอกสารตามเมนูที่เลือก
@@ -757,6 +888,32 @@ export default function App() {
                 <label className="block text-sm font-medium mb-1">ชื่อบริษัท (ภาษาไทย / อังกฤษ)</label>
                 <input value={company.company_name} onChange={e => setCompany({ ...company, company_name: e.target.value })} className="w-full border border-slate-200 px-3 py-2 rounded-xl text-sm" />
               </div>
+              <div>
+                <label className="block text-sm font-medium mb-2">โลโก้บริษัท</label>
+                <div className="flex items-center gap-4">
+                  <img
+                    src={companyLogoPreview || company.logo_url || speedyPackageExpressLogo}
+                    alt="ตัวอย่างโลโก้บริษัท"
+                    className="w-20 h-20 object-contain rounded-xl border border-slate-200 bg-white p-1"
+                  />
+                  <div className="space-y-2">
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      onChange={handleCompanyLogoChange}
+                      className="block w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-blue-50 file:px-3 file:py-2 file:font-medium file:text-blue-700 hover:file:bg-blue-100"
+                    />
+                    <p className="text-xs text-slate-500">รองรับ PNG, JPG, WEBP ขนาดไม่เกิน 5 MB</p>
+                    <button
+                      type="button"
+                      onClick={handleResetCompanyLogo}
+                      className="text-xs text-slate-500 hover:text-slate-800 underline"
+                    >
+                      ใช้โลโก้เริ่มต้น
+                    </button>
+                  </div>
+                </div>
+              </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium mb-1">เลขประจำตัวผู้เสียภาษี</label>
@@ -814,7 +971,7 @@ export default function App() {
               <button onClick={() => window.print()} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-sm font-medium flex items-center gap-1.5">
                 <Printer className="w-4 h-4" /> พิมพ์ / PDF
               </button>
-              <button onClick={() => setSelectedDoc(null)} className="p-2 hover:bg-slate-700 rounded-xl text-slate-300">
+              <button onClick={handleCloseDocument} className="p-2 hover:bg-slate-700 rounded-xl text-slate-300">
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -828,7 +985,32 @@ export default function App() {
                 <p className="text-xs text-slate-500 mt-1">{company.address}</p>
                 <p className="text-xs text-slate-500">เลขประจำตัวผู้เสียภาษี: {company.tax_id} | โทร: {company.phone}</p>
               </div>
-              <div className="text-right">
+              <div className="flex flex-col items-end text-right">
+                <img
+                  src={documentLogoPreview || selectedDoc.logo_url || company.logo_url || speedyPackageExpressLogo}
+                  alt="โลโก้บริษัท Speedy Package Express"
+                  className="w-20 h-20 object-contain mb-3"
+                />
+                {isEditing && (
+                  <div className="no-print mb-3 flex flex-col items-end gap-1">
+                    <label className="cursor-pointer rounded-lg bg-blue-50 px-2.5 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100">
+                      เปลี่ยนโลโก้เอกสาร
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        onChange={handleDocumentLogoChange}
+                        className="hidden"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleUseCompanyLogo}
+                      className="text-xs text-slate-500 hover:text-slate-800 underline"
+                    >
+                      ใช้โลโก้บริษัท
+                    </button>
+                  </div>
+                )}
                 <h1 className="text-2xl font-bold text-blue-700 tracking-wide">{getDocTitles(selectedDoc.doc_type).th}</h1>
                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest">{getDocTitles(selectedDoc.doc_type).en}</p>
                 <div className="mt-2 text-sm"><span className="text-slate-500">เลขที่: </span><span className="font-bold">{selectedDoc.doc_no}</span></div>
