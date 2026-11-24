@@ -1,13 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
+import Login from './Login';
 import speedyPackageExpressLogo from './assets/speedy-package-express-logo.png';
 import {
   FileText, Plus, Search, Printer, Edit3, Save, Trash2,
   CheckCircle, Clock, X, Building2, RefreshCw, LayoutDashboard,
-  Receipt, FileSpreadsheet, Users, Package, Settings, ArrowRightCircle
+  Receipt, FileSpreadsheet, Users, Package, Settings, ArrowRightCircle,
+  LogOut, Paperclip, ExternalLink, Upload, PenTool
 } from 'lucide-react';
 
 export default function App() {
+  // State สำหรับระบบล็อกอิน (Supabase Auth)
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [activeMenu, setActiveMenu] = useState('dashboard'); // dashboard | quotation | invoice | receipt | customers | products | settings
   const [documents, setDocuments] = useState([]);
   const [customers, setCustomers] = useState([]);
@@ -17,7 +23,9 @@ export default function App() {
     tax_id: '0105566001234',
     address: '999 อาคารออฟฟิศทาวเวอร์ ถนนพระราม 9 กรุงเทพฯ 10310',
     phone: '02-123-4567',
-    bank_info: ''
+    bank_info: '',
+    logo_url: null,
+    signature_url: null
   });
 
   const [loading, setLoading] = useState(true);
@@ -28,8 +36,12 @@ export default function App() {
   const [selectedDoc, setSelectedDoc] = useState(null);
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [uploadingCustomerSig, setUploadingCustomerSig] = useState(false);
   const [companyLogoFile, setCompanyLogoFile] = useState(null);
   const [companyLogoPreview, setCompanyLogoPreview] = useState(null);
+  const [companySignatureFile, setCompanySignatureFile] = useState(null);
+  const [companySignaturePreview, setCompanySignaturePreview] = useState(null);
   const [documentLogoFile, setDocumentLogoFile] = useState(null);
   const [documentLogoPreview, setDocumentLogoPreview] = useState(null);
 
@@ -38,7 +50,21 @@ export default function App() {
   const [editingCustomer, setEditingCustomer] = useState(null);
   const [newProduct, setNewProduct] = useState({ name: '', description: '', unit: 'งาน', unit_price: 0 });
 
-  // โหลดข้อมูลทั้งหมดจาก Supabase
+  // ตรวจสอบสถานะการล็อกอิน
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // โหลดข้อมูลทั้งหมดจาก Supabase เมื่อล็อกอินแล้ว
   const fetchAllData = async () => {
     setLoading(true);
     const [docsRes, custRes, prodRes, compRes] = await Promise.all([
@@ -56,8 +82,10 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchAllData();
-  }, []);
+    if (session) {
+      fetchAllData();
+    }
+  }, [session]);
 
   // คำนวณยอดเงิน
   const calculateTotals = (doc) => {
@@ -73,7 +101,7 @@ export default function App() {
 
   const getLogoUploadErrorMessage = (error) => {
     if (error.message?.toLowerCase().includes('bucket not found')) {
-      return 'ยังไม่มีพื้นที่เก็บโลโก้ใน Supabase กรุณารัน SQL migration 20261123010000_add_company_logo_storage.sql และ 20261123020000_add_document_logo_override.sql ตามลำดับใน Supabase SQL Editor แล้วลองใหม่';
+      return 'ยังไม่มีพื้นที่เก็บไฟล์ (company-assets) ใน Supabase กรุณารัน SQL migration หรือสร้าง Storage bucket ชื่อ company-assets แบบ Public ก่อน';
     }
     return error.message;
   };
@@ -118,7 +146,7 @@ export default function App() {
     setIsEditing(true);
   };
 
-  // แปลงเอกสารข้ามขั้นตอน (เช่น QT -> INV หรือ INV -> REC)
+  // แปลงเอกสารข้ามขั้นตอน (QT -> INV ส่งต่อลายเซ็นลูกค้า / INV -> REC ส่งต่อทั้งลายเซ็นลูกค้าและสลิปโอนเงิน)
   const handleConvertDocument = async (sourceDoc, targetType) => {
     const labelMap = { invoice: 'ใบแจ้งหนี้ (INV)', receipt: 'ใบเสร็จรับเงิน (REC)' };
     const requiredStatus = 'approved';
@@ -143,7 +171,11 @@ export default function App() {
     const uniqueSuffix = Date.now().toString().slice(-4);
     const newDocNo = `${prefixMap[targetType]}-${new Date().getFullYear()}-${uniqueSuffix}`;
 
-    const { id, quotation_items, created_at, doc_no, doc_type, source_document_id, ...restHeader } = sourceDoc;
+    const {
+      id, quotation_items, created_at, doc_no, doc_type,
+      source_document_id, ...restHeader
+    } = sourceDoc;
+
     const { data: createdDoc, error } = await supabase
       .from('quotations')
       .insert([{
@@ -175,6 +207,183 @@ export default function App() {
     await fetchAllData();
     setActiveMenu(targetType);
     alert(`สร้าง ${newDocNo} เรียบร้อยแล้ว!`);
+  };
+
+  // 1. อัปโหลดหลักฐานการโอนเงิน / สลิป (แสดงในใบแจ้งหนี้ และส่งต่อไปยังใบเสร็จรับเงิน)
+  const handleUploadPaymentProof = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !selectedDoc) return;
+
+    const allowedTypes = ['application/pdf', 'image/png', 'image/jpeg', 'image/webp'];
+    if (!allowedTypes.includes(file.type)) {
+      alert('รองรับเฉพาะไฟล์ PDF, PNG, JPG หรือ WEBP เท่านั้น');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      alert('ขนาดไฟล์หลักฐานต้องไม่เกิน 10 MB');
+      e.target.value = '';
+      return;
+    }
+
+    setUploadingAttachment(true);
+    const fileExt = file.name.split('.').pop();
+    const storagePath = `payment-proofs/${selectedDoc.id}.${fileExt}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('company-assets')
+      .upload(storagePath, file, {
+        cacheControl: '0',
+        contentType: file.type,
+        upsert: true
+      });
+
+    if (uploadError) {
+      alert('อัปโหลดหลักฐานการโอนไม่สำเร็จ: ' + getLogoUploadErrorMessage(uploadError));
+      setUploadingAttachment(false);
+      e.target.value = '';
+      return;
+    }
+
+    const { data } = supabase.storage.from('company-assets').getPublicUrl(storagePath);
+    const publicUrlWithVersion = `${data.publicUrl}?v=${Date.now()}`;
+
+    const updates = {
+      attachment_url: publicUrlWithVersion,
+      attachment_name: file.name,
+      ...(selectedDoc.doc_type === 'invoice' ? { status: 'approved' } : {})
+    };
+
+    const { error: updateError } = await supabase
+      .from('quotations')
+      .update(updates)
+      .eq('id', selectedDoc.id);
+
+    if (updateError) {
+      alert('บันทึกข้อมูลหลักฐานการโอนไม่สำเร็จ: ' + updateError.message);
+      setUploadingAttachment(false);
+      e.target.value = '';
+      return;
+    }
+
+    const updatedDoc = { ...selectedDoc, ...updates };
+    setSelectedDoc(updatedDoc);
+    setDocuments(docs => docs.map(d => (d.id === selectedDoc.id ? updatedDoc : d)));
+    setUploadingAttachment(false);
+    e.target.value = '';
+    alert(
+      selectedDoc.doc_type === 'invoice'
+        ? `แนบสลิป "${file.name}" และเปลี่ยนสถานะเป็น "ชำระเงินแล้ว" เรียบร้อย!`
+        : `แนบหลักฐาน "${file.name}" เรียบร้อยแล้ว!`
+    );
+  };
+
+  // ลบหลักฐานการโอนเงิน
+  const handleRemovePaymentProof = async () => {
+    if (!selectedDoc) return;
+    if (!window.confirm(`ต้องการลบหลักฐาน "${selectedDoc.attachment_name}" ออกหรือไม่?`)) return;
+
+    setUploadingAttachment(true);
+    const { error } = await supabase
+      .from('quotations')
+      .update({ attachment_url: null, attachment_name: null })
+      .eq('id', selectedDoc.id);
+
+    if (error) {
+      alert('ลบหลักฐานไม่สำเร็จ: ' + error.message);
+      setUploadingAttachment(false);
+      return;
+    }
+
+    const updatedDoc = { ...selectedDoc, attachment_url: null, attachment_name: null };
+    setSelectedDoc(updatedDoc);
+    setDocuments(docs => docs.map(d => (d.id === selectedDoc.id ? updatedDoc : d)));
+    setUploadingAttachment(false);
+  };
+
+  // 2. อัปโหลดรูปลายเซ็นลูกค้า (แสดงในช่องเซ็นชื่อลูกค้าบนกระดาษ A4 และส่งต่อไปเอกสารใบถัดไป)
+  const handleUploadCustomerSignature = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !selectedDoc) return;
+
+    const allowedTypes = ['image/png', 'image/jpeg', 'image/webp'];
+    if (!allowedTypes.includes(file.type)) {
+      alert('ลายเซ็นลูกค้าต้องเป็นไฟล์รูปภาพ PNG, JPG หรือ WEBP เท่านั้น (แนะนำ PNG พื้นหลังโปร่งใส)');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      alert('ขนาดไฟล์ลายเซ็นต้องไม่เกิน 5 MB');
+      e.target.value = '';
+      return;
+    }
+
+    setUploadingCustomerSig(true);
+    const storagePath = `customer-signatures/${selectedDoc.id}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('company-assets')
+      .upload(storagePath, file, {
+        cacheControl: '0',
+        contentType: file.type,
+        upsert: true
+      });
+
+    if (uploadError) {
+      alert('อัปโหลดลายเซ็นลูกค้าไม่สำเร็จ: ' + getLogoUploadErrorMessage(uploadError));
+      setUploadingCustomerSig(false);
+      e.target.value = '';
+      return;
+    }
+
+    const { data } = supabase.storage.from('company-assets').getPublicUrl(storagePath);
+    const publicUrlWithVersion = `${data.publicUrl}?v=${Date.now()}`;
+
+    const updates = {
+      customer_signature_url: publicUrlWithVersion,
+      ...(selectedDoc.doc_type === 'quotation' ? { status: 'approved' } : {})
+    };
+
+    const { error: updateError } = await supabase
+      .from('quotations')
+      .update(updates)
+      .eq('id', selectedDoc.id);
+
+    if (updateError) {
+      alert('บันทึกลายเซ็นลูกค้าไม่สำเร็จ: ' + updateError.message);
+      setUploadingCustomerSig(false);
+      e.target.value = '';
+      return;
+    }
+
+    const updatedDoc = { ...selectedDoc, ...updates };
+    setSelectedDoc(updatedDoc);
+    setDocuments(docs => docs.map(d => (d.id === selectedDoc.id ? updatedDoc : d)));
+    setUploadingCustomerSig(false);
+    e.target.value = '';
+  };
+
+  // ลบรูปลายเซ็นลูกค้าออกจากช่องเซ็นชื่อ A4
+  const handleRemoveCustomerSignature = async () => {
+    if (!selectedDoc) return;
+    if (!window.confirm('ต้องการลบรูปลายเซ็นลูกค้าออกจากเอกสารนี้หรือไม่?')) return;
+
+    setUploadingCustomerSig(true);
+    const { error } = await supabase
+      .from('quotations')
+      .update({ customer_signature_url: null })
+      .eq('id', selectedDoc.id);
+
+    if (error) {
+      alert('ลบรูปลายเซ็นลูกค้าไม่สำเร็จ: ' + error.message);
+      setUploadingCustomerSig(false);
+      return;
+    }
+
+    const updatedDoc = { ...selectedDoc, customer_signature_url: null };
+    setSelectedDoc(updatedDoc);
+    setDocuments(docs => docs.map(d => (d.id === selectedDoc.id ? updatedDoc : d)));
+    setUploadingCustomerSig(false);
   };
 
   // บันทึกการแก้ไขเอกสาร A4
@@ -334,7 +543,7 @@ export default function App() {
     }
   };
 
-  // บันทึกตั้งค่าบริษัท
+  // บันทึกตั้งค่าบริษัท (รวมอัปโหลดโลโก้ และ ลายเซ็น/ตราประทับ)
   const handleSaveCompany = async (e) => {
     e.preventDefault();
     setSaving(true);
@@ -360,7 +569,28 @@ export default function App() {
       logoUrl = `${data.publicUrl}?v=${Date.now()}`;
     }
 
-    const updatedCompany = { ...company, logo_url: logoUrl };
+    let signatureUrl = company.signature_url || null;
+    if (companySignatureFile) {
+      const sigPath = 'company-signature/current';
+      const { error: sigUploadError } = await supabase.storage
+        .from('company-assets')
+        .upload(sigPath, companySignatureFile, {
+          cacheControl: '0',
+          contentType: companySignatureFile.type,
+          upsert: true
+        });
+
+      if (sigUploadError) {
+        alert('อัปโหลดลายเซ็น/ตราประทับไม่สำเร็จ: ' + getLogoUploadErrorMessage(sigUploadError));
+        setSaving(false);
+        return;
+      }
+
+      const { data } = supabase.storage.from('company-assets').getPublicUrl(sigPath);
+      signatureUrl = `${data.publicUrl}?v=${Date.now()}`;
+    }
+
+    const updatedCompany = { ...company, logo_url: logoUrl, signature_url: signatureUrl };
     const { error } = await supabase.from('company_settings').upsert({ id: 1, ...updatedCompany });
     if (error) {
       alert('บันทึกข้อมูลบริษัทไม่สำเร็จ: ' + error.message);
@@ -371,56 +601,46 @@ export default function App() {
     setCompany(updatedCompany);
     setCompanyLogoFile(null);
     setCompanyLogoPreview(null);
+    setCompanySignatureFile(null);
+    setCompanySignaturePreview(null);
     setSaving(false);
     alert('บันทึกข้อมูลบริษัทเรียบร้อยแล้ว!');
   };
 
-  const handleCompanyLogoChange = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  const validateAndPreviewImage = (file, e, setFile, setPreview) => {
     if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
-      alert('เลือกไฟล์ภาพ PNG, JPG หรือ WEBP เท่านั้น');
+      alert('เลือกไฟล์ภาพ PNG, JPG หรือ WEBP เท่านั้น (แนะนำไฟล์ PNG พื้นหลังโปร่งใส)');
       e.target.value = '';
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
-      alert('ขนาดไฟล์โลโก้ต้องไม่เกิน 5 MB');
+      alert('ขนาดไฟล์ภาพต้องไม่เกิน 5 MB');
       e.target.value = '';
       return;
     }
 
     const reader = new FileReader();
     reader.onload = () => {
-      setCompanyLogoFile(file);
-      setCompanyLogoPreview(String(reader.result));
+      setFile(file);
+      setPreview(String(reader.result));
     };
     reader.onerror = () => alert('อ่านไฟล์ภาพไม่สำเร็จ กรุณาลองเลือกไฟล์อีกครั้ง');
     reader.readAsDataURL(file);
   };
 
+  const handleCompanyLogoChange = (e) => {
+    const file = e.target.files?.[0];
+    if (file) validateAndPreviewImage(file, e, setCompanyLogoFile, setCompanyLogoPreview);
+  };
+
+  const handleCompanySignatureChange = (e) => {
+    const file = e.target.files?.[0];
+    if (file) validateAndPreviewImage(file, e, setCompanySignatureFile, setCompanySignaturePreview);
+  };
+
   const handleDocumentLogoChange = (e) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-
-    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
-      alert('เลือกไฟล์ภาพ PNG, JPG หรือ WEBP เท่านั้น');
-      e.target.value = '';
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      alert('ขนาดไฟล์โลโก้ต้องไม่เกิน 5 MB');
-      e.target.value = '';
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      setDocumentLogoFile(file);
-      setDocumentLogoPreview(String(reader.result));
-    };
-    reader.onerror = () => alert('อ่านไฟล์ภาพไม่สำเร็จ กรุณาลองเลือกไฟล์อีกครั้ง');
-    reader.readAsDataURL(file);
+    if (file) validateAndPreviewImage(file, e, setDocumentLogoFile, setDocumentLogoPreview);
   };
 
   const handleUseCompanyLogo = () => {
@@ -439,6 +659,12 @@ export default function App() {
     setCompanyLogoFile(null);
     setCompanyLogoPreview(null);
     setCompany({ ...company, logo_url: null });
+  };
+
+  const handleRemoveCompanySignature = () => {
+    setCompanySignatureFile(null);
+    setCompanySignaturePreview(null);
+    setCompany({ ...company, signature_url: null });
   };
 
   // กรองเอกสารตามเมนูที่เลือก
@@ -470,6 +696,20 @@ export default function App() {
     if (type === 'receipt') return 'ผู้มีอำนาจลงนาม';
     return 'ผู้อนุมัติใบเสนอราคา';
   };
+
+  // หน้าโหลดระหว่างตรวจสอบสิทธิ์
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500">
+        กำลังตรวจสอบสิทธิ์การเข้าใช้งาน...
+      </div>
+    );
+  }
+
+  // หากยังไม่ล็อกอิน ให้แสดงหน้า Login
+  if (!session) {
+    return <Login />;
+  }
 
   return (
     <div className="flex min-h-screen bg-slate-50 text-slate-800">
@@ -549,6 +789,19 @@ export default function App() {
             </div>
           </div>
         </nav>
+
+        {/* ข้อมูลพนักงานและปุ่มออกจากระบบ */}
+        <div className="p-4 border-t border-slate-800">
+          <div className="text-xs text-slate-400 truncate mb-2 px-2" title={session.user.email}>
+            {session.user.email}
+          </div>
+          <button
+            onClick={() => supabase.auth.signOut()}
+            className="w-full flex items-center gap-3 px-4 py-2.5 text-red-400 hover:bg-slate-800 rounded-xl font-medium text-sm transition"
+          >
+            <LogOut className="w-5 h-5" /> ออกจากระบบ
+          </button>
+        </div>
       </aside>
 
       {/* Main Content */}
@@ -613,10 +866,20 @@ export default function App() {
               <div className="divide-y divide-slate-100">
                 {documents.slice(0, 5).map(doc => (
                   <div key={doc.id} className="py-3 flex justify-between items-center">
-                    <div>
-                      <span className="font-bold text-blue-600 mr-3">{doc.doc_no}</span>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-blue-600">{doc.doc_no}</span>
                       <span className="font-medium text-slate-800">{doc.customer_name}</span>
-                      <span className="text-xs text-slate-400 ml-2">({doc.project_title})</span>
+                      <span className="text-xs text-slate-400">({doc.project_title})</span>
+                      {doc.attachment_url && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-50 text-emerald-700 rounded text-xs font-medium" title={`มีหลักฐานการโอน: ${doc.attachment_name}`}>
+                          <Paperclip className="w-3 h-3" /> สลิปโอนเงิน
+                        </span>
+                      )}
+                      {doc.customer_signature_url && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-50 text-blue-700 rounded text-xs font-medium">
+                          <PenTool className="w-3 h-3" /> ลูกค้าเซ็นแล้ว
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-4">
                       <span className="font-semibold">฿{calculateTotals(doc).grandTotal.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
@@ -644,7 +907,7 @@ export default function App() {
                    activeMenu === 'invoice' ? 'รวมใบแจ้งหนี้ / ใบวางบิล (Invoices)' :
                    'รวมใบเสร็จรับเงิน / ใบกำกับภาษี (Receipts)'}
                 </h2>
-                <p className="text-slate-500 text-sm">สร้าง แก้ไข สั่งพิมพ์ PDF และส่งต่อเอกสารข้ามขั้นตอน</p>
+                <p className="text-slate-500 text-sm">สร้าง แก้ไข สั่งพิมพ์ PDF แนบสลิป/ลายเซ็นลูกค้า และส่งต่อเอกสารข้ามขั้นตอน</p>
               </div>
               <button
                 onClick={() => handleCreateDocument(activeMenu)}
@@ -706,7 +969,27 @@ export default function App() {
                   ) : (
                     filteredDocs.map(doc => (
                       <tr key={doc.id} className="hover:bg-slate-50/80">
-                        <td className="py-4 px-6 font-semibold text-blue-600">{doc.doc_no}</td>
+                        <td className="py-4 px-6">
+                          <div className="font-semibold text-blue-600 flex items-center gap-1.5">
+                            {doc.doc_no}
+                            {doc.attachment_url && (
+                              <a
+                                href={doc.attachment_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={`เปิดดูสลิปการโอน: ${doc.attachment_name}`}
+                                className="text-emerald-600 hover:text-emerald-700"
+                              >
+                                <Paperclip className="w-4 h-4" />
+                              </a>
+                            )}
+                            {doc.customer_signature_url && (
+                              <span title="มีลายเซ็นลูกค้าในเอกสารแล้ว" className="text-blue-600">
+                                <PenTool className="w-3.5 h-3.5" />
+                              </span>
+                            )}
+                          </div>
+                        </td>
                         <td className="py-4 px-6">
                           <div className="font-medium text-slate-900">{doc.customer_name}</div>
                           <div className="text-xs text-slate-500">{doc.project_title}</div>
@@ -745,7 +1028,7 @@ export default function App() {
                             <button
                               onClick={() => handleConvertDocument(doc, 'receipt')}
                               disabled={doc.status !== 'approved' || documents.some(item => item.doc_type === 'receipt' && String(item.source_document_id) === String(doc.id))}
-                              title={doc.status !== 'approved' ? 'ต้องบันทึกสถานะชำระเงินก่อน' : 'ออกใบเสร็จรับเงิน'}
+                              title={doc.status !== 'approved' ? 'ต้องแนบสลิปหรือบันทึกชำระเงินก่อน' : 'ออกใบเสร็จรับเงิน'}
                               className="px-2.5 py-1.5 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-xs font-medium inline-flex items-center gap-1"
                             >
                               <ArrowRightCircle className="w-3.5 h-3.5" /> ออกใบเสร็จ
@@ -894,14 +1177,16 @@ export default function App() {
         {/* ================= 5. หน้าตั้งค่าข้อมูลบริษัท ================= */}
         {activeMenu === 'settings' && (
           <div className="max-w-2xl space-y-6">
-            <h2 className="text-2xl font-bold text-slate-900">ตั้งค่าข้อมูลบริษัท (หัวกระดาษ A4)</h2>
-            <form onSubmit={handleSaveCompany} className="bg-white p-6 rounded-2xl border border-slate-200 space-y-4">
+            <h2 className="text-2xl font-bold text-slate-900">ตั้งค่าข้อมูลบริษัท (หัวกระดาษ และ ลายเซ็น A4)</h2>
+            <form onSubmit={handleSaveCompany} className="bg-white p-6 rounded-2xl border border-slate-200 space-y-5">
               <div>
                 <label className="block text-sm font-medium mb-1">ชื่อบริษัท (ภาษาไทย / อังกฤษ)</label>
                 <input value={company.company_name} onChange={e => setCompany({ ...company, company_name: e.target.value })} className="w-full border border-slate-200 px-3 py-2 rounded-xl text-sm" />
               </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">โลโก้บริษัท</label>
+
+              {/* อัปโหลดโลโก้บริษัท */}
+              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <label className="block text-sm font-semibold text-slate-800 mb-2">1. โลโก้บริษัท (มุมขวาบนของกระดาษ A4)</label>
                 <div className="flex items-center gap-4">
                   <img
                     src={companyLogoPreview || company.logo_url || speedyPackageExpressLogo}
@@ -926,6 +1211,43 @@ export default function App() {
                   </div>
                 </div>
               </div>
+
+              {/* อัปโหลดลายเซ็นผู้มีอำนาจลงนาม / ตราประทับบริษัท */}
+              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <label className="block text-sm font-semibold text-slate-800 mb-2">2. ลายเซ็นผู้มีอำนาจลงนาม / ตราประทับบริษัท (ช่องเซ็นชื่อด้านล่าง A4)</label>
+                <div className="flex items-center gap-4">
+                  <div className="w-36 h-20 rounded-xl border border-dashed border-slate-300 bg-white flex items-center justify-center overflow-hidden p-1.5">
+                    {(companySignaturePreview || company.signature_url) ? (
+                      <img
+                        src={companySignaturePreview || company.signature_url}
+                        alt="ตัวอย่างลายเซ็นและตราประทับ"
+                        className="max-h-full max-w-full object-contain"
+                      />
+                    ) : (
+                      <span className="text-xs text-slate-400 text-center">ยังไม่มีรูปลายเซ็น</span>
+                    )}
+                  </div>
+                  <div className="space-y-2">
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      onChange={handleCompanySignatureChange}
+                      className="block w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-emerald-50 file:px-3 file:py-2 file:font-medium file:text-emerald-700 hover:file:bg-emerald-100"
+                    />
+                    <p className="text-xs text-slate-500">แนะนำไฟล์ PNG พื้นหลังโปร่งใส (Transparent) ขนาดไม่เกิน 5 MB</p>
+                    {(companySignaturePreview || company.signature_url) && (
+                      <button
+                        type="button"
+                        onClick={handleRemoveCompanySignature}
+                        className="text-xs text-red-500 hover:text-red-700 underline"
+                      >
+                        ลบรูปลายเซ็น / ตราประทับออก
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium mb-1">เลขประจำตัวผู้เสียภาษี</label>
@@ -955,6 +1277,7 @@ export default function App() {
       {/* ================= MODAL กระดาษ A4 แก้ไขได้ + สั่งพิมพ์ ================= */}
       {selectedDoc && (
         <div className="fixed inset-0 bg-slate-900/70 z-50 overflow-y-auto flex flex-col items-center py-6 px-4">
+          {/* แถบเครื่องมือบนสุด */}
           <div className="w-full max-w-[210mm] bg-slate-800 text-white px-6 py-3.5 rounded-t-2xl flex flex-wrap justify-between items-center gap-3 no-print">
             <div className="flex items-center gap-3">
               <span className="font-semibold">{selectedDoc.doc_no}</span>
@@ -988,6 +1311,53 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* แถบแนบสลิปการโอนเงิน (แสดงเฉพาะในใบแจ้งหนี้ และ ใบเสร็จรับเงิน - ซ่อนตอนสั่งพิมพ์) */}
+          {(selectedDoc.doc_type === 'invoice' || selectedDoc.doc_type === 'receipt') && (
+            <div className="w-full max-w-[210mm] bg-emerald-50/90 border-x border-b border-emerald-200 px-6 py-2.5 flex flex-wrap justify-between items-center gap-3 no-print text-sm">
+              <div className="flex items-center gap-2 text-slate-700">
+                <Paperclip className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span className="font-semibold text-emerald-950">หลักฐานการโอนเงิน (สลิป):</span>
+                {selectedDoc.attachment_url ? (
+                  <a
+                    href={selectedDoc.attachment_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-emerald-700 hover:underline font-medium"
+                  >
+                    {selectedDoc.attachment_name || 'เปิดดูสลิปโอนเงิน'}
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                ) : (
+                  <span className="text-slate-500">ยังไม่ได้แนบสลิปการโอนเงิน</span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <label className="cursor-pointer inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-emerald-300 hover:bg-emerald-100/50 text-emerald-800 rounded-lg text-xs font-semibold shadow-xs">
+                  <Upload className="w-3.5 h-3.5 text-emerald-600" />
+                  {uploadingAttachment ? 'กำลังอัปโหลด...' : selectedDoc.attachment_url ? 'เปลี่ยนสลิปการโอน' : 'แนบสลิปการโอนเงิน'}
+                  <input
+                    type="file"
+                    accept="application/pdf,image/png,image/jpeg,image/webp"
+                    disabled={uploadingAttachment}
+                    onChange={handleUploadPaymentProof}
+                    className="hidden"
+                  />
+                </label>
+                {selectedDoc.attachment_url && (
+                  <button
+                    type="button"
+                    disabled={uploadingAttachment}
+                    onClick={handleRemovePaymentProof}
+                    className="px-2.5 py-1.5 bg-red-50 text-red-600 hover:bg-red-100 rounded-lg text-xs font-medium"
+                  >
+                    ลบไฟล์
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
           <div id="printable-a4" className="w-full max-w-[210mm] min-h-[297mm] bg-white p-12 shadow-2xl text-slate-800">
             {/* หัวกระดาษดึงจาก company_settings */}
@@ -1161,70 +1531,122 @@ export default function App() {
               </div>
             )}
 
-            {/* สรุปยอดเงินและบัญชีธนาคาร */}
+            {/* สรุปยอดเงิน บัญชีธนาคาร และช่องเซ็นชื่อ */}
             {(() => {
               const { subtotal, discountAmount, vatAmount, whtAmount, grandTotal } = calculateTotals(selectedDoc);
               return (
                 <div className="space-y-8">
                   <div className="flex justify-between items-start gap-8">
-                  <div className="flex-1 text-xs text-slate-600 space-y-3">
-                    <div>
-                      <div className="font-bold text-slate-700 mb-1">หมายเหตุ / เงื่อนไข:</div>
-                      {isEditing ? (
-                        <textarea rows="3" value={selectedDoc.notes || ''} onChange={e => setSelectedDoc({ ...selectedDoc, notes: e.target.value })} className="w-full border border-amber-300 bg-amber-50/40 p-2 rounded" />
-                      ) : (
-                        <p className="whitespace-pre-line">{selectedDoc.notes}</p>
+                    <div className="flex-1 text-xs text-slate-600 space-y-3">
+                      <div>
+                        <div className="font-bold text-slate-700 mb-1">หมายเหตุ / เงื่อนไข:</div>
+                        {isEditing ? (
+                          <textarea rows="3" value={selectedDoc.notes || ''} onChange={e => setSelectedDoc({ ...selectedDoc, notes: e.target.value })} className="w-full border border-amber-300 bg-amber-50/40 p-2 rounded" />
+                        ) : (
+                          <p className="whitespace-pre-line">{selectedDoc.notes}</p>
+                        )}
+                      </div>
+                      {company.bank_info && (
+                        <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+                          <div className="font-bold text-slate-700">ช่องทางการชำระเงิน:</div>
+                          <p className="whitespace-pre-line mt-0.5">{company.bank_info}</p>
+                        </div>
                       )}
                     </div>
-                    {company.bank_info && (
-                      <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
-                        <div className="font-bold text-slate-700">ช่องทางการชำระเงิน:</div>
-                        <p className="whitespace-pre-line mt-0.5">{company.bank_info}</p>
+
+                    <div className="w-72 text-sm space-y-2">
+                      <div className="flex justify-between"><span className="text-slate-500">รวมเป็นเงิน</span><span>{subtotal.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span></div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500">ส่วนลด {isEditing && <input type="number" value={selectedDoc.discount_percent} onChange={e => setSelectedDoc({ ...selectedDoc, discount_percent: Number(e.target.value) })} className="w-12 border border-amber-300 px-1 rounded text-right ml-1" />}%</span>
+                        <span className="text-red-600">-{discountAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
                       </div>
-                    )}
+                      <div className="flex justify-between items-center">
+                        <label className="text-slate-500 flex items-center gap-1.5">
+                          {isEditing && <input type="checkbox" checked={selectedDoc.vat_enabled} onChange={e => setSelectedDoc({ ...selectedDoc, vat_enabled: e.target.checked })} />}
+                          ภาษีมูลค่าเพิ่ม 7%
+                        </label>
+                        <span>{vatAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500">หัก ณ ที่จ่าย {isEditing ? (
+                          <select value={selectedDoc.wht_percent} onChange={e => setSelectedDoc({ ...selectedDoc, wht_percent: Number(e.target.value) })} className="border border-amber-300 rounded px-1 ml-1">
+                            <option value={0}>0%</option><option value={1}>1%</option><option value={3}>3%</option><option value={5}>5%</option>
+                          </select>
+                        ) : `${selectedDoc.wht_percent}%`}</span>
+                        <span className="text-red-600">-{whtAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
+                      </div>
+                      <div className="flex justify-between font-bold text-base border-t-2 border-slate-800 pt-2 text-blue-700">
+                        <span>ยอดเงินสุทธิ</span>
+                        <span>฿{grandTotal.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="w-72 text-sm space-y-2">
-                    <div className="flex justify-between"><span className="text-slate-500">รวมเป็นเงิน</span><span>{subtotal.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span></div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-slate-500">ส่วนลด {isEditing && <input type="number" value={selectedDoc.discount_percent} onChange={e => setSelectedDoc({ ...selectedDoc, discount_percent: Number(e.target.value) })} className="w-12 border border-amber-300 px-1 rounded text-right ml-1" />}%</span>
-                      <span className="text-red-600">-{discountAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <label className="text-slate-500 flex items-center gap-1.5">
-                        {isEditing && <input type="checkbox" checked={selectedDoc.vat_enabled} onChange={e => setSelectedDoc({ ...selectedDoc, vat_enabled: e.target.checked })} />}
-                        ภาษีมูลค่าเพิ่ม 7%
-                      </label>
-                      <span>{vatAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-slate-500">หัก ณ ที่จ่าย {isEditing ? (
-                        <select value={selectedDoc.wht_percent} onChange={e => setSelectedDoc({ ...selectedDoc, wht_percent: Number(e.target.value) })} className="border border-amber-300 rounded px-1 ml-1">
-                          <option value={0}>0%</option><option value={1}>1%</option><option value={3}>3%</option><option value={5}>5%</option>
-                        </select>
-                      ) : `${selectedDoc.wht_percent}%`}</span>
-                      <span className="text-red-600">-{whtAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-bold text-base border-t-2 border-slate-800 pt-2 text-blue-700">
-                      <span>ยอดเงินสุทธิ</span>
-                      <span>฿{grandTotal.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-                  </div>
+                  {/* ช่องเซ็นชื่อด้านล่างกระดาษ A4 */}
                   <div className="mt-8 grid grid-cols-2 gap-6 text-center text-sm text-slate-700">
-                    <div className="min-h-40 rounded-2xl border border-slate-200 px-5 py-4">
+                    {/* กล่องฝั่งลูกค้า (แนบลายเซ็นแล้วแสดงบนเส้นประ A4 ทันที และส่งต่อไปยัง INV / REC) */}
+                    <div className="min-h-44 rounded-2xl border border-slate-200 px-5 py-4 flex flex-col justify-between">
                       <div className="font-bold text-slate-900">สำหรับลูกค้า ({getCustomerSignatureLabel(selectedDoc.doc_type)})</div>
-                      <div className="mx-auto mt-12 w-4/5 border-b border-dotted border-slate-400" />
-                      <div className="mt-2">(ลงชื่อ) ........................................................</div>
-                      <div className="mt-1">{getCustomerSignatureLabel(selectedDoc.doc_type)}</div>
-                      <div className="mt-1">วันที่ ........../........../..........</div>
+                      <div className="h-16 flex items-end justify-center relative">
+                        {selectedDoc.customer_signature_url && (
+                          <img
+                            src={selectedDoc.customer_signature_url}
+                            alt="ลายเซ็นลูกค้า"
+                            className="max-h-16 max-w-[180px] object-contain -mb-2 z-10"
+                          />
+                        )}
+                        <div className="w-4/5 border-b border-dotted border-slate-400 absolute bottom-0" />
+                      </div>
+                      <div>
+                        <div>(ลงชื่อ) ........................................................</div>
+                        <div className="mt-1">{getCustomerSignatureLabel(selectedDoc.doc_type)}</div>
+                        <div className="mt-1">วันที่ ........../........../..........</div>
+
+                        {/* ปุ่มแนบลายเซ็นลูกค้า (ซ่อนอัตโนมัติตอนสั่งพิมพ์ PDF) */}
+                        <div className="no-print mt-2.5 flex items-center justify-center gap-2">
+                          <label className="cursor-pointer inline-flex items-center gap-1 px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg text-xs font-medium">
+                            <PenTool className="w-3 h-3" />
+                            {uploadingCustomerSig ? 'กำลังอัปโหลด...' : selectedDoc.customer_signature_url ? 'เปลี่ยนลายเซ็นลูกค้า' : 'แนบลายเซ็นลูกค้า'}
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/webp"
+                              disabled={uploadingCustomerSig}
+                              onChange={handleUploadCustomerSignature}
+                              className="hidden"
+                            />
+                          </label>
+                          {selectedDoc.customer_signature_url && (
+                            <button
+                              type="button"
+                              disabled={uploadingCustomerSig}
+                              onClick={handleRemoveCustomerSignature}
+                              className="text-xs text-red-500 hover:underline"
+                            >
+                              ลบออก
+                            </button>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                    <div className="min-h-40 rounded-2xl border border-slate-200 px-5 py-4">
+
+                    {/* กล่องฝั่งบริษัท (แสดงรูปลายเซ็น / ตราประทับอัตโนมัติถ้าอัปโหลดไว้) */}
+                    <div className="min-h-44 rounded-2xl border border-slate-200 px-5 py-4 flex flex-col justify-between">
                       <div className="font-bold text-slate-900">ในนาม {company.company_name}</div>
-                      <div className="mx-auto mt-12 w-4/5 border-b border-dotted border-slate-400" />
-                      <div className="mt-2">(ลงชื่อ) ........................................................</div>
-                      <div className="mt-1">{getCompanySignatureLabel(selectedDoc.doc_type)}</div>
-                      <div className="mt-1">วันที่ ........../........../..........</div>
+                      <div className="h-16 flex items-end justify-center relative">
+                        {company.signature_url && (
+                          <img
+                            src={company.signature_url}
+                            alt="ลายเซ็นผู้มีอำนาจลงนาม"
+                            className="max-h-16 max-w-[180px] object-contain -mb-2 z-10"
+                          />
+                        )}
+                        <div className="w-4/5 border-b border-dotted border-slate-400 absolute bottom-0" />
+                      </div>
+                      <div>
+                        <div>(ลงชื่อ) ........................................................</div>
+                        <div className="mt-1">{getCompanySignatureLabel(selectedDoc.doc_type)}</div>
+                        <div className="mt-1">วันที่ {selectedDoc.issue_date || '........../........../..........'}</div>
+                      </div>
                     </div>
                   </div>
                 </div>
